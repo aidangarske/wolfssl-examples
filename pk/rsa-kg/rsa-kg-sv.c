@@ -33,6 +33,13 @@
 #define DEF_KEYS_GEN        128
 #define DEF_SV_CHECKS       512
 
+/* func_args from test.h, so don't have to pull in other stuff */
+typedef struct func_args {
+    int    argc;
+    char** argv;
+    int    return_code;
+} func_args;
+
 /* Load the RSA private key */
 int load_rsa_key(RsaKey *key)
 {
@@ -90,10 +97,51 @@ void usage()
     fprintf(stderr, "\n");
 }
 
-int main(int argc, char *argv[])
+#include <wolfssl/wolfcrypt/mem_track.h>
+
+#ifdef WOLFSSL_TRACK_MEMORY_VERBOSE
+static long heap_baselineAllocs;
+static long heap_baselineBytes;
+
+#define PRINT_HEAP_INIT() { \
+    (void)wolfCrypt_heap_peakAllocs_checkpoint();                \
+    heap_baselineAllocs = wolfCrypt_heap_peakAllocs_checkpoint();\
+    (void)wolfCrypt_heap_peakBytes_checkpoint();                 \
+    heap_baselineBytes = wolfCrypt_heap_peakBytes_checkpoint();  \
+}
+
+#define PRINT_HEAP_CHECKPOINT() {                                            \
+    const ssize_t _rha = wolfCrypt_heap_peakAllocs_checkpoint() - heap_baselineAllocs; \
+    const ssize_t _rhb = wolfCrypt_heap_peakBytes_checkpoint() - heap_baselineBytes;   \
+    printf("    relative heap peak usage: %ld alloc%s, %ld bytes\n",         \
+           (long int)_rha,                                                   \
+           _rha == 1 ? "" : "s",                                             \
+           (long int)_rhb);                                                  \
+    heap_baselineAllocs = wolfCrypt_heap_peakAllocs_checkpoint();            \
+    heap_baselineBytes = wolfCrypt_heap_peakBytes_checkpoint();              \
+    }
+#else
+#define PRINT_HEAP_INIT() WC_DO_NOTHING
+#define PRINT_HEAP_CHECKPOINT() WC_DO_NOTHING
+#endif
+
+#ifdef HAVE_STACK_SIZE_VERBOSE
+#define TEST_CHECKPOINT(...) {                              \
+    STACK_SIZE_CHECKPOINT(printf(__VA_ARGS__));             \
+    PRINT_HEAP_CHECKPOINT();                                \
+}
+#else
+#define TEST_CHECKPOINT(...) WC_DO_NOTHING
+#endif
+
+#ifdef HAVE_STACK_SIZE
+THREAD_RETURN WOLFSSL_THREAD rsa_test(void* args)
+#else
+wc_test_ret_t rsa_test(void* args)
+#endif
 {
     int ec = 0;
-    int ret;
+    int ret = 0;
     RsaKey key;
     WC_RNG rng;
     unsigned char hash[WC_SHA512_DIGEST_SIZE];
@@ -107,6 +155,10 @@ int main(int argc, char *argv[])
     int numKeys = DEF_KEYS_GEN;
     int checks = DEF_SV_CHECKS;
     int load_key = 0;
+
+    func_args* fargs = (func_args*)args;
+    int argc = fargs->argc;
+    char** argv = fargs->argv;
 
     /* Skip program name */
     --argc;
@@ -123,7 +175,7 @@ int main(int argc, char *argv[])
             if (--argc == 0) {
                 fprintf(stderr, "Missing bits value\n");
                 usage();
-                return 1;
+                EXIT_TEST(ret);
             }
             bits = atoi(*argv);
         }
@@ -133,7 +185,7 @@ int main(int argc, char *argv[])
             if (--argc == 0) {
                 fprintf(stderr, "Missing number of keys value\n");
                 usage();
-                return 1;
+                EXIT_TEST(ret);
             }
             numKeys = atoi(*argv);
         }
@@ -143,7 +195,7 @@ int main(int argc, char *argv[])
             if (--argc == 0) {
                 fprintf(stderr, "Missing check count value\n");
                 usage();
-                return 1;
+                EXIT_TEST(ret);
             }
             checks = atoi(*argv);
         }
@@ -153,7 +205,7 @@ int main(int argc, char *argv[])
             if (--argc == 0) {
                 fprintf(stderr, "Missing hash size value\n");
                 usage();
-                return 1;
+                EXIT_TEST(ret);
             }
             hashSz = atoi(*argv);
         }
@@ -164,7 +216,7 @@ int main(int argc, char *argv[])
         else {
             fprintf(stderr, "Unrecognized option: %s\n", *argv);
             usage();
-            return 1;
+            EXIT_TEST(ret);
         }
 
         --argc;
@@ -181,7 +233,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Bits out of range (%d-%d): %d\n", MIN_RSA_BITS,
                 MAX_RSA_BITS, bits);
         usage();
-        return 1;
+        EXIT_TEST(ret);
     }
 #ifdef WOLFSSL_SP_MATH
     if (0) {
@@ -218,20 +270,20 @@ int main(int argc, char *argv[])
     if (numKeys < 1) {
         fprintf(stderr, "Number of key out of range (1+): %d\n", numKeys);
         usage();
-        return 1;
+        EXIT_TEST(numKeys);
     }
     /* Check count */
     if (checks < 0) {
         fprintf(stderr, "Number of checks out of range (0+): %d\n", checks);
         usage();
-        return 1;
+        EXIT_TEST(checks);
     }
     /* Check hash size is valid */
     if (hashSz < 1 || hashSz > WC_SHA512_DIGEST_SIZE) {
         fprintf(stderr, "Hash size out of range (1-%d): %d\n",
                 WC_SHA512_DIGEST_SIZE, hashSz);
         usage();
-        return 1;
+        EXIT_TEST(ret);
     }
     /* Display the options in use */
     if (!load_key) {
@@ -244,11 +296,13 @@ int main(int argc, char *argv[])
     printf("Checks:     %d\n", checks);
     printf("Hash Size:  %d\n", hashSz);
 
+    TEST_CHECKPOINT("rsa_test: Start\n");
+
     /* Initialize random number generator */
     ret = wc_InitRng(&rng);
     if (ret != 0) {
         fprintf(stderr, "Failed to initialize random\n");
-        return 1;
+        EXIT_TEST(ret);
     }
 
     /* Initialize RSA key structure */
@@ -256,7 +310,7 @@ int main(int argc, char *argv[])
     if (ret != 0) {
         wc_FreeRng(&rng);
         fprintf(stderr, "Failed to initialize RSA key\n");
-        return 1;
+        EXIT_TEST(ret);
     }
 
     /* Perform operations for specified number of keys */
@@ -271,14 +325,7 @@ int main(int argc, char *argv[])
                 ec = 1;
                 break;
             }
-
-            /* Check the RSA key */
-            ret = wc_CheckRsaKey(&key);
-            if (ret != 0) {
-                fprintf(stderr, "Key failed checks\n");
-                ec = 1;
-                break;
-            }
+            TEST_CHECKPOINT("rsa_test: MakeKey\n");
 
             /* Generate a new hash */
             ret = wc_RNG_GenerateBlock(&rng, hash, sizeof(hash));
@@ -305,6 +352,7 @@ int main(int argc, char *argv[])
         for (i = 0; i < checks; i++) {
             /* Sign with RSA key */
             ret = wc_RsaSSL_Sign(hash, hashSz, sig, sizeof(sig), &key, &rng);
+            TEST_CHECKPOINT("rsa_test: Sign\n");
             if (ret < 0) {
                 print_rsa(&key);
                 print_data("digest", hash, hashSz);
@@ -320,6 +368,7 @@ int main(int argc, char *argv[])
 
             /* Verify with RSA key */
             ret = wc_RsaSSL_VerifyInline(sig, sig_len, &out, &key);
+            TEST_CHECKPOINT("rsa_test: Verify\n");
             if (ret < 0) {
                 print_rsa(&key);
                 print_data("digest", hash, hashSz);
@@ -350,7 +399,7 @@ int main(int argc, char *argv[])
                 ec = 1;
                 break;
             }
-    
+
             fprintf(stderr, ".");
         }
 
@@ -365,6 +414,26 @@ int main(int argc, char *argv[])
     wc_FreeRsaKey(&key);
     wc_FreeRng(&rng);
 
-    return ec;
+    EXIT_TEST(ret);
+}
+
+int main(int argc, char** argv)
+{
+    func_args args = { 0, 0, 0 };
+
+    args.argc = argc;
+    args.argv = argv;
+
+    wolfCrypt_Init();
+
+#ifdef HAVE_STACK_SIZE
+    StackSizeCheck(&args, rsa_test);
+#else
+    rsa_test(&args);
+#endif
+
+    wolfCrypt_Cleanup();
+
+    return args.return_code;
 }
 
